@@ -4,12 +4,14 @@ import utils
 import os
 import random
 import argparse
+import datetime
 import numpy as np
 
 from torch.utils import data
-from datasets import VOCSegmentation, Cityscapes
+from datasets import VOCSegmentation, Cityscapes, SynCityscapes
 from utils import ext_transforms as et
 from metrics import StreamSegMetrics
+from tensorboardX import SummaryWriter
 
 import torch
 import torch.nn as nn
@@ -27,7 +29,7 @@ def get_argparser():
     parser.add_argument("--data_root", type=str, default='./datasets/data',
                         help="path to Dataset")
     parser.add_argument("--dataset", type=str, default='voc',
-                        choices=['voc', 'cityscapes'], help='Name of dataset')
+                        choices=['voc', 'cityscapes', "syncityscapes"], help='Name of dataset')
     parser.add_argument("--num_classes", type=int, default=None,
                         help="num classes (default: None)")
 
@@ -130,7 +132,7 @@ def get_dataset(opts):
 
     if opts.dataset == 'cityscapes':
         train_transform = et.ExtCompose([
-            # et.ExtResize( 512 ),
+            # et.ExtResize(opts.crop_size),
             et.ExtRandomCrop(size=(opts.crop_size, opts.crop_size)),
             et.ExtColorJitter(brightness=0.5, contrast=0.5, saturation=0.5),
             et.ExtRandomHorizontalFlip(),
@@ -150,6 +152,25 @@ def get_dataset(opts):
                                split='train', transform=train_transform)
         val_dst = Cityscapes(root=opts.data_root,
                              split='val', transform=val_transform)
+        
+    if opts.dataset == 'syncityscapes':
+        train_transform = et.ExtCompose([
+            et.ExtRandomHorizontalFlip(),
+            et.ExtToTensor(),
+            et.ExtNormalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]),
+        ])
+
+        val_transform = et.ExtCompose([
+            # et.ExtResize( 512 ),
+            et.ExtToTensor(),
+            et.ExtNormalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]),
+        ])
+
+        train_dst = SynCityscapes(root=opts.data_root, transform=train_transform)
+        # val_dst = SynCityscapes(root=opts.data_root, transform=val_transform)
+        val_dst = Cityscapes(root="datasets/data/cityscapes", split='val', transform=val_transform)
     return train_dst, val_dst
 
 
@@ -213,6 +234,8 @@ def main():
     if opts.dataset.lower() == 'voc':
         opts.num_classes = 21
     elif opts.dataset.lower() == 'cityscapes':
+        opts.num_classes = 19
+    elif opts.dataset.lower() == 'syncityscapes':
         opts.num_classes = 19
 
     # Setup visualization
@@ -283,7 +306,10 @@ def main():
         }, path)
         print("Model saved as %s" % path)
 
-    utils.mkdir('checkpoints')
+    res_path = os.path.join('checkpoints', datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    if not os.path.exists(res_path):
+        os.makedirs(res_path)
+    writer = SummaryWriter(res_path, flush_secs=30)
     # Restore
     best_score = 0.0
     cur_itrs = 0
@@ -345,21 +371,26 @@ def main():
                 interval_loss = interval_loss / 10
                 print("Epoch %d, Itrs %d/%d, Loss=%f" %
                       (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
+                writer.add_scalar('Loss', interval_loss, cur_itrs)
+                writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], cur_itrs)
                 interval_loss = 0.0
 
             if (cur_itrs) % opts.val_interval == 0:
-                save_ckpt('checkpoints/latest_%s_%s_os%d.pth' %
-                          (opts.model, opts.dataset, opts.output_stride))
+                save_ckpt(os.path.join(res_path, 'latest_%s_%s_os%d.pth' %
+                          (opts.model, opts.dataset, opts.output_stride)))
                 print("validation...")
                 model.eval()
                 val_score, ret_samples = validate(
                     opts=opts, model=model, loader=val_loader, device=device, metrics=metrics,
                     ret_samples_ids=vis_sample_id)
                 print(metrics.to_str(val_score))
+                writer.add_scalar('Val/Overall Acc', val_score['Overall Acc'], cur_itrs)
+                writer.add_scalar('Val/Mean Acc', val_score['Mean Acc'], cur_itrs)
+                writer.add_scalar('Val/Mean IoU', val_score['Mean IoU'], cur_itrs)
                 if val_score['Mean IoU'] > best_score:  # save best model
                     best_score = val_score['Mean IoU']
-                    save_ckpt('checkpoints/best_%s_%s_os%d.pth' %
-                              (opts.model, opts.dataset, opts.output_stride))
+                    save_ckpt(os.path.join(res_path, 'best_%s_%s_os%d.pth' %
+                              (opts.model, opts.dataset, opts.output_stride)))
 
                 if vis is not None:  # visualize validation score and samples
                     vis.vis_scalar("[Val] Overall Acc", cur_itrs, val_score['Overall Acc'])

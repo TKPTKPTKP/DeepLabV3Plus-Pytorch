@@ -9,3 +9,6 @@ results
 checkpoints_bak
 cityscapes
 test_results
+result/
+syn_data/
+test.ipynb
